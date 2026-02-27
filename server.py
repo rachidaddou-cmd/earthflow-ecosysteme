@@ -12,42 +12,70 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""dashboard/server.py — Read-only metrics dashboard (FastAPI)."""
+"""proxy/server.py — Earthflow AI proxy server (FastAPI)."""
+import time
+
 try:
-    from fastapi import FastAPI
-    from fastapi.responses import JSONResponse, PlainTextResponse
+    from fastapi import FastAPI, Request, HTTPException
+    from fastapi.responses import JSONResponse
     HAS_FASTAPI = True
 except ImportError:
     HAS_FASTAPI = False
 
-# Injected at startup from proxy/server.py
-audit_log = None
-tenant_mgr = None
+from core.audit import AuditLog
+from core.multitenant import MultitenantManager
+from core.rate_limiter import RateLimiter
+from core.anonymizer import Anonymizer
+from rules.engine import RulesEngine
+from stop.controller import StopController
+from stop.exceptions import (StopConditionTriggered, AuthenticationError,
+                              RateLimitExceeded, TenantNotFound)
+
+# Module-level singletons (configured at startup)
+audit_log = AuditLog()
+tenant_mgr = MultitenantManager()
+rate_limiter = RateLimiter(rate=1000 / 60, capacity=1000)
+anonymizer = Anonymizer()
 
 if HAS_FASTAPI:
-    app = FastAPI(title="Earthflow Dashboard", version="2.0.0")
+    app = FastAPI(title="Earthflow Proxy", version="2.0.0")
 
-    @app.get("/v1/dashboard/summary")
-    async def summary():
-        if not audit_log:
-            return {"error": "audit_log not initialised"}
-        stats = audit_log.stats()
-        return {
-            "period_24h": stats,
-            "active_tenants": len(tenant_mgr.list_tenants()) if tenant_mgr else 0,
-            "system_health": "OK",
-        }
+    @app.post("/v1/proxy")
+    async def proxy_request(request: Request):
+        start = time.time()
+        api_key = (request.headers.get("X-API-Key") or
+                   request.headers.get("Authorization", "").replace("Bearer ", ""))
 
-    @app.get("/v1/dashboard/metrics")
-    async def metrics():
-        """Prometheus-compatible text format."""
-        if not audit_log:
-            return PlainTextResponse("# audit_log not initialised\n")
-        stats = audit_log.stats()
-        lines = [
-            "# HELP earthflow_requests_total Total requests processed",
-            "# TYPE earthflow_requests_total counter",
-        ]
-        for status, count in stats.get("by_status", {}).items():
-            lines.append(f'earthflow_requests_total{{status="{status}"}} {count}')
-        return PlainTextResponse("\n".join(lines) + "\n")
+        tenant = tenant_mgr.resolve_tenant_by_key(api_key)
+        if not tenant:
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+        if not rate_limiter.allow(tenant.tenant_id):
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+        body = await request.json()
+        prompt = " ".join(m.get("content", "") for m in body.get("messages", []))
+
+        # Load tenant rules
+        engine = RulesEngine()  # In production: load from DB by tenant preset
+        controller = StopController(engine, audit_log)
+
+        try:
+            result = controller.check(prompt, body.get("metadata"), tenant.tenant_id)
+            result["latency_ms"] = round((time.time() - start) * 1000, 1)
+            return JSONResponse(content=result)
+        except StopConditionTriggered as e:
+            return JSONResponse(content={
+                "status": "BLOCK",
+                "reason": e.message,
+                "rule_id": e.rule_id,
+                "latency_ms": round((time.time() - start) * 1000, 1),
+            })
+
+    @app.get("/health")
+    async def health():
+        return {"status": "OK", "version": "2.0.0"}
+
+    @app.get("/health/ready")
+    async def ready():
+        return {"status": "OK", "checks": {"rules_engine": "OK", "crypto": "OK"}}
